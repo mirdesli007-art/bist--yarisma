@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from core import data, journal, news, risk, signals
+from core import data, journal, news, risk, signals, swing, viop
 from core.universe import BIST100, INDEXES, MACRO
 
 st.set_page_config(page_title="BIST Yarışma Asistanı", page_icon="📈", layout="wide",
@@ -61,11 +61,15 @@ with st.sidebar:
     st.divider()
     st.subheader("VİOP")
     v_eq = st.number_input("VİOP bakiyesi (TL)", value=75_000.0, step=1000.0)
-    v_mult = st.number_input("Kontrat çarpanı", value=10.0, step=1.0,
-                             help="Matriks'te kontrat detayından kontrol et (1 puanın TL değeri).")
-    v_margin = st.number_input("Kontrat başı başlangıç teminatı (TL)", value=0.0, step=100.0,
-                               help="Matriks'te emir ekranında görünür. Girmeden kontrat hesaplanmaz.")
-    v_max_margin = st.slider("Teminata en fazla (% VİOP bakiye)", 10, 90, 50, 5)
+    v_risk = st.slider("VİOP işlem başı risk (% VİOP bakiye)", 1.0, 15.0, 5.0, 0.5,
+                       help="Stop olursan VİOP bakiyesinin bu kadarını kaybedersin. Yarışmada VİOP küçük bir "
+                            "kısım olduğu için hisseden yüksek tutulabilir.")
+    v_max_lev = st.slider("En fazla kaldıraç (nominal / VİOP bakiye)", 1.0, 10.0, 4.0, 0.5,
+                          help="Açtığın kontratların toplam büyüklüğü bakiyenin en fazla kaç katı olsun.")
+    v_max_margin = st.slider("Teminata en fazla (% VİOP bakiye)", 10, 90, 60, 5)
+    tl_rate = st.number_input("TL faizi (yıllık %, taşıma maliyeti için)", value=35.0, step=1.0,
+                              help="TCMB politika faizine yakın bir değer gir. VİOP sekmesindeki baz hesabı "
+                                   "gerçek taşıma maliyetini zaten gösterir.") / 100
     st.divider()
     auto = st.toggle("Otomatik yenile (5 dk)", value=True)
     if st.button("🔄 Verileri şimdi yenile", use_container_width=True):
@@ -79,9 +83,19 @@ def load_intraday():
     return data.download(BIST100, "30d", "5m")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner="Günlük veriler çekiliyor…")
 def load_daily():
-    return data.download(BIST100 + list(INDEXES.values()), "1y", "1d")
+    return data.download(BIST100 + list(INDEXES.values()), "3y", "1d")
+
+
+@st.cache_data(ttl=1800, show_spinner="VİOP dayanak verileri çekiliyor…")
+def load_viop():
+    return data.download(["GC=F", "SI=F", "XU030.IS", "USDTRY=X"], "3y", "1d")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Momentum stratejisi 3 yıllık veride test ediliyor…")
+def swing_bt():
+    return swing.backtest_breakout(load_daily())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -172,7 +186,75 @@ st.markdown(f"### 📈 BIST Yarışma Asistanı  \n{'🟢' if is_open else '🔴
 st.caption("Fiyatlar Yahoo Finance'ten, ~15 dk gecikmeli. Emir vermeden önce fiyatı Matriks'te kontrol et. "
            "Yatırım tavsiyesi değildir.")
 
-tabs = st.tabs(["📡 Tarayıcı", "🔎 Hisse", "📰 Haberler", "📊 VİOP", "🧮 Risk", "📒 Günlük", "📋 Plan"])
+tabs = st.tabs(["🚀 Momentum", "📊 VİOP", "⚡ Gün içi", "🔎 Hisse", "📰 Haberler", "🧮 Risk", "📒 Günlük",
+                "📋 Plan"])
+T_MOM, T_VIOP, T_INTRA, T_STOCK, T_NEWS, T_RISK, T_JOURNAL, T_PLAN = tabs
+
+
+# ================= MOMENTUM (hisse swing) =================
+with T_MOM:
+    dd_all = load_daily()
+    xu = dd_all.get("XU100.IS")
+    if xu is not None:
+        reg = swing.market_regime(xu)
+        if reg["yukarı"]:
+            st.success(f"**Piyasa trendi: YUKARI** · BIST 100 haftalık, 10 haftalık ortalamanın "
+                       f"%{reg['uzaklık%']:+.1f} üstünde → momentum alımları için uygun ortam.")
+        else:
+            st.warning(f"**Piyasa trendi: AŞAĞI/ZAYIF** · BIST 100, 10 haftalık ortalamanın "
+                       f"%{reg['uzaklık%']:+.1f} altında. Testte rotasyon stratejisi bu dönemlerde **nakitte** "
+                       f"bekliyordu → yeni alımları küçük tut, pozisyon sayısını azalt.")
+    sc = swing.scan(dd_all)
+    if sc.empty:
+        st.warning("Veri yok.")
+    else:
+        def size(r):
+            z = risk.stock_size(eq, cash, r["Son"], r["Stop (10G dip)"], risk_pct, max_pos, comm)
+            return pd.Series({"Lot": z.get("lot", 0), "Tutar": round(z.get("tutar", 0))})
+        sc[["Lot", "Tutar"]] = sc.apply(size, axis=1)
+        brk = sc[sc["Sinyal"] == "KIRILIM AL"].sort_values("Momentum sırası")
+        trd = sc[sc["Sinyal"] == "TRENDDE"].sort_values("Momentum sırası")
+        top = sc[sc["50G ort üstü"]].sort_values("Momentum sırası").head(10)
+        cols = ["Sembol", "Sinyal", "Son", "Gün%", "1A%", "3A%", "Hacim x", "Stop (10G dip)", "Risk%", "RSI",
+                "Momentum sırası", "Lot", "Tutar"]
+        cfg = {"Sembol": st.column_config.TextColumn(pinned=True),
+               "Stop (10G dip)": st.column_config.NumberColumn(help="Kapanış bunun altına inerse sat"),
+               "Risk%": st.column_config.NumberColumn(help="Girişten stop'a uzaklık. %8 üstü ise lot küçülür."),
+               "Hacim x": st.column_config.NumberColumn(
+                   help="Bugünkü hacim / 20 günlük ortalama. Seans içinde gün bitmediği için düşük görünür; "
+                        "kırılım teyidi için 17:00 sonrasına bak."),
+               "Momentum sırası": st.column_config.NumberColumn(help="Son 3 ayın getirisine göre sıra (1 = en güçlü)")}
+
+        st.markdown(f"#### 🚀 Bugün kırılım yapanlar ({len(brk)})")
+        st.caption("20 günlük zirveyi **1,5x hacimle** kırdı ve 50 günlük ortalamanın üstünde. "
+                   "Testte: ertesi açılışta al, kapanış 10 günlük dibin altına inince sat.")
+        if brk.empty:
+            st.info("Bugün kriterleri sağlayan kırılım yok. (Gün içinde değişebilir; kapanışa doğru tekrar bak.)")
+        else:
+            st.dataframe(brk[cols], hide_index=True, use_container_width=True, column_config=cfg)
+
+        st.markdown(f"#### 📈 Son 5 günde kırılım yapıp trendde kalanlar ({len(trd)})")
+        if not trd.empty:
+            st.dataframe(trd[cols], hide_index=True, use_container_width=True, column_config=cfg)
+
+        st.markdown("#### 🏆 Momentum ilk 10 (son 3 ay, 50G ortalama üstü)")
+        st.caption("Haftalık rotasyon: her cuma ilk 5'i tut, listeden düşeni sat. Piyasa trendi AŞAĞI iken nakitte bekle.")
+        st.dataframe(top[cols], hide_index=True, use_container_width=True, column_config=cfg)
+
+        ex = sc[sc["Sinyal"] == "ÇIKIŞ"]
+        if len(ex):
+            with st.expander(f"🔻 10 günlük dibin altına inenler ({len(ex)}) — elinde varsa SAT"):
+                st.dataframe(ex[cols], hide_index=True, use_container_width=True)
+
+        with st.expander("📊 Bu strateji geçmişte ne yaptı? (3 yıl, tüm hisseler)"):
+            bt = swing_bt()
+            cut = pd.Timestamp.now(tz="Europe/Istanbul") - pd.Timedelta(days=548)
+            s_all, s_rec = swing.bt_summary(bt), swing.bt_summary(bt, cut)
+            st.dataframe(pd.DataFrame({"3 yıl": s_all, "Son 1,5 yıl": s_rec}), use_container_width=True)
+            st.caption("Kazanma oranı düşük (%40 civarı) ama kazananlar kaybedenlerden çok daha büyük; ortalamayı onlar "
+                       "taşıyor. Bu yüzden **stop'a sadık kal, kazananı erken satma.** Uyarı: test bugünkü BIST 100 "
+                       "listesiyle yapıldı (geçmişte yükselenler listede kaldığı için sonuçlar olduğundan iyi görünebilir). "
+                       "Aşırı uç sonuçlar (veri hatası şüphesi) hariç tutuldu.")
 
 
 # ================= 1) TARAYICI =================
@@ -223,12 +305,15 @@ def render_scanner():
             st.success("Gönderildi") if tg_send(msg) else st.error("Gönderilemedi")
 
 
-with tabs[0]:
+with T_INTRA:
+    st.error("⚠️ **Dürüst uyarı:** Bu gün içi AL algoritması son 60 işlem gününde ileriye bakmadan test edildi: "
+             "518 işlem, %39 kazanma, işlem başı ortalama **−0,05R** (yani zarar). Tek başına para kazandırmıyor. "
+             "Bu sekmeyi giriş zamanlaması ve gün içi takip için kullan; **hisse seçimini Momentum sekmesinden yap.**")
     (st.fragment(run_every=300)(render_scanner) if auto else render_scanner)()
 
 
 # ================= 2) HİSSE ANALİZİ =================
-with tabs[1]:
+with T_STOCK:
     sym = st.selectbox("Hisse", BIST100, index=BIST100.index("THYAO"))
     d5, dd = load_intraday(), load_daily()
     df5, dfd = d5.get(f"{sym}.IS"), dd.get(f"{sym}.IS")
@@ -327,63 +412,119 @@ def render_news():
                "🟢/🔴 kelime bazlı kaba bir yön tahminidir; başlığı kendin oku.")
 
 
-with tabs[2]:
+with T_NEWS:
     (st.fragment(run_every=600)(render_news) if auto else render_news)()
 
 
 # ================= 4) VİOP =================
-with tabs[3]:
-    st.caption("VİOP için 75.000 TL. Yahoo'da vadeli kontrat verisi yok; yön BIST 30 endeksi / USDTRY'den hesaplanır, "
-               "kontrat fiyatını Matriks'ten gir.")
-    under = st.radio("Dayanak", ["BIST 30 (XU030)", "USD/TRY"], horizontal=True)
-    usym = "XU030.IS" if under.startswith("BIST") else "USDTRY=X"
-    mi, md = load_market()
-    i5, d1 = mi.get(usym), md.get(usym)
-    if i5 is None or d1 is None:
-        st.warning("Veri yok.")
-    else:
-        if usym.endswith(".IS"):
-            i5 = i5.between_time("10:00", "18:05")
-        last = float(i5.Close.iloc[-1])
-        today = i5[i5.index.date == i5.index[-1].date()]
-        e20d = float(d1.Close.ewm(span=20).mean().iloc[-1])
-        e20i = float(i5.Close.ewm(span=20).mean().iloc[-1])
-        r14 = float(signals.rsi(i5.Close).iloc[-1])
-        atr_d = float(signals.atr(d1).iloc[-1])
-        up = sum([last > e20d, last > e20i, last > float(today.Open.iloc[0]), r14 > 50])
-        bias = "LONG (yükseliş)" if up >= 3 else ("SHORT (düşüş)" if up <= 1 else "NÖTR - bekle")
-        c = st.columns(4)
-        c[0].metric("Son", f"{last:,.2f}")
-        c[1].metric("Yön", bias.split()[0])
-        c[2].metric("5dk RSI", f"{r14:.0f}")
-        c[3].metric("Günlük ATR", f"{atr_d:,.1f}")
-        st.write(f"**Yön önerisi: {bias}** · günlük EMA20 {e20d:,.1f} · 5dk EMA20 {e20i:,.1f}")
+with T_VIOP:
+    st.caption(f"VİOP bakiyesi {v_eq:,.0f} TL · Sistem: günlük **EMA10/30 trend takibi** (hızlı ortalama yavaşın "
+               "üstündeyse LONG, altındaysa SHORT). Testler **vadeli taşıma maliyeti dahil** yapıldı.")
+    vraw = load_viop()
+    rows, sers = [], {}
+    for name, spec in viop.INSTRUMENTS.items():
+        d = viop.series(vraw, name)
+        if d is None or len(d) < 120:
+            continue
+        sers[name] = d
+        sg = viop.signal(d)
+        rec = viop.backtest(d, spec["kind"], tl_rate, "L/S").iloc[-375:]
+        stt = viop.stats(rec, v_max_lev)
+        st1 = viop.stats(rec, 1)
+        if name == "BIST 30 Endeks":
+            verdict = "⛔ Long yok · SHORT sadece korunma" if sg["yön"] == "SHORT" else "⛔ Long için hisse al"
+        elif name == "USD/TRY":
+            verdict = "⛔ Long taşıma kaybettirir"
+        elif st1["sharpe"] >= 0.5:
+            verdict = f"✅ Trend takibi uygun → {sg['yön']}"
+        else:
+            verdict = "⚠️ Zayıf geçmiş"
+        rows.append({"Araç": name, "Trend": sg["yön"], "Başlangıç": sg["başlangıç"].strftime("%d.%m"),
+                     "Son": round(sg["son"], 2), "5G%": round(sg["ret5%"], 1), "1A%": round(sg["ret21%"], 1),
+                     "Günlük oynaklık%": round(sg["atr%"], 2), "Test yıllık% (1x)": st1["yıllık%"],
+                     "Sharpe": st1["sharpe"], f"30g kötü% ({v_max_lev:g}x)": stt["30g kötü (p10)%"],
+                     f"30g orta% ({v_max_lev:g}x)": stt["30g orta%"], f"30g iyi% ({v_max_lev:g}x)": stt["30g iyi (p90)%"],
+                     "Öneri": verdict})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                     column_config={"Araç": st.column_config.TextColumn(pinned=True),
+                                    "Test yıllık% (1x)": st.column_config.NumberColumn(
+                                        help="Son 1,5 yılda bu trend sisteminin kaldıraçsız yıllık getirisi (taşıma dahil)"),
+                                    "Sharpe": st.column_config.NumberColumn(help=">0,5 iyi, <0 kötü")})
+        st.caption("30g kötü/orta/iyi: son 1,5 yılda herhangi bir 30 günlük dönemde, seçili kaldıraçla VİOP bakiyene "
+                   "ne olurdu (en kötü %10, ortanca, en iyi %10). Kaldıraç kazancı da kaybı da aynı oranda büyütür.")
 
-        fig = go.Figure(go.Candlestick(x=today.index, open=today.Open, high=today.High, low=today.Low, close=today.Close))
-        fig.add_trace(go.Scatter(x=today.index, y=today.Close.ewm(span=20).mean(), name="EMA20"))
-        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False, showlegend=False)
+    pick = st.selectbox("Detay", list(sers), index=0)
+    d = sers.get(pick)
+    if d is not None:
+        spec = viop.INSTRUMENTS[pick]
+        sg = viop.signal(d)
+        st.info(spec["note"])
+        x = d.iloc[-130:]
+        fig = go.Figure(go.Candlestick(x=x.index, open=x.Open, high=x.High, low=x.Low, close=x.Close, name=pick))
+        fig.add_trace(go.Scatter(x=x.index, y=d.Close.ewm(span=10).mean().iloc[-130:], name="EMA10", line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=x.index, y=d.Close.ewm(span=30).mean().iloc[-130:], name="EMA30", line=dict(width=1.5)))
+        fig.add_hline(y=sg["stop"], line_dash="dot", line_color="#d62728", annotation_text="Stop")
+        fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False,
+                          legend=dict(orientation="h"))
         st.plotly_chart(fig, use_container_width=True)
+        st.write(f"**Trend: {sg['yön']}** ({sg['başlangıç']:%d.%m.%Y}'den beri) · son {sg['son']:,.2f} · "
+                 f"önerilen stop (spot) **{sg['stop']:,.2f}** · EMA10/EMA30 farkı %{sg['fark%']:+.2f}")
 
-        st.markdown("#### Kontrat hesabı")
-        cc = st.columns(3)
-        kp = cc[0].number_input("Kontrat fiyatı (Matriks)", value=0.0, step=0.25)
-        ratio = kp / last if kp > 0 else 1
-        sugg = round(kp - 0.6 * atr_d * ratio if up >= 2 else kp + 0.6 * atr_d * ratio, 2) if kp else 0.0
-        ks = cc[1].number_input("Stop", value=sugg, step=0.25, help="Öneri: 0,6 x günlük ATR")
-        side = cc[2].selectbox("Yön", ["Uzun (AL)", "Kısa (SAT)"], index=0 if up >= 2 else 1)
-        if kp and ks and v_margin > 0:
-            vs = risk.viop_size(v_eq, v_margin, v_mult, kp, ks, risk_pct, v_max_margin)
-            tgt = kp + (kp - ks) * rr if side.startswith("Uzun") else kp - (ks - kp) * rr
-            st.success(f"**{vs['kontrat']} kontrat** · teminat {vs['teminat']:,.0f} TL · stop olursa ≈ "
-                       f"{vs['risk_tl']:,.0f} TL zarar · hedef {tgt:,.2f} ({vs['sınırlayan']} sınırladı)")
-        elif v_margin <= 0:
-            st.info("Ayarlar menüsüne (sol üst ›) kontrat teminatını ve çarpanını gir.")
-        st.caption("VİOP kaldıraçlıdır: küçük endeks hareketi bakiyeyi hızlı değiştirir. Gece boyunca pozisyon taşıma "
-                   "(akşam seansı) riskini bil.")
+        modes = {"Trend L/S": "L/S", "Sadece long": "long", "Sadece short": "short",
+                 "Al-tut (long)": "hold_long", "Sürekli short (taşıma kazancı)": "hold_short"}
+        tbl = {k: viop.stats(viop.backtest(d, spec["kind"], tl_rate, m).iloc[-375:], 1) for k, m in modes.items()}
+        with st.expander("Strateji karşılaştırması (son 1,5 yıl, 1x, taşıma dahil)"):
+            st.dataframe(pd.DataFrame(tbl).T, use_container_width=True)
+
+        st.markdown("#### 🧾 Taşıma maliyeti (baz) — Matriks'ten vadeli fiyatı gir")
+        b1, b2 = st.columns(2)
+        fut = b1.number_input("Vadeli kontrat fiyatı", value=0.0, step=0.01, key=f"fut_{pick}")
+        dte = b2.number_input("Vadeye kalan gün", value=30, step=1, key=f"dte_{pick}")
+        spot_conv = sg["son"]
+        if fut > 0:
+            bs = viop.basis(spot_conv, fut, int(dte))
+            if bs:
+                st.write(f"Vadeli spottan **%{bs['baz%']:+.2f}** farklı (yıllık %{bs['yıllık%']:.1f}, aylık "
+                         f"%{bs['aylık%']:.2f}). LONG açarsan başa baş için dayanağın vadeye kadar en az bu kadar "
+                         f"yükselmesi gerekir; SHORT açarsan bu fark lehine çalışır.")
+                st.caption("Not: Spot fiyat Yahoo'dan ve gecikmeli; birim farkı varsa (ör. endeks puanı) baz yanlış çıkar, "
+                           "o zaman Matriks'teki spot ile kendin karşılaştır.")
+
+        st.markdown("#### 🧮 Kontrat hesabı")
+        k1, k2, k3 = st.columns(3)
+        kp = k1.number_input("Kontrat fiyatı", value=float(fut) if fut else 0.0, step=0.01, key=f"kp_{pick}")
+        mult = k2.number_input("Kontrat büyüklüğü / çarpan", value=1.0, step=0.1, key=f"mul_{pick}",
+                               help="1 fiyat biriminin kaç TL ettiği (Matriks kontrat detayı). $ bazlı kontratta "
+                                    "dolar kuruyla çarp.")
+        marg = k3.number_input("Kontrat başı teminat (TL)", value=0.0, step=100.0, key=f"mar_{pick}")
+        side_long = sg["yön"] == "LONG"
+        ratio = kp / sg["son"] if kp > 0 else 1
+        stop_k = round(sg["stop"] * ratio, 4) if kp else 0.0
+        ks = st.number_input("Stop (kontrat fiyatıyla)", value=float(stop_k), step=0.01, key=f"ks_{pick}",
+                             help="Trend stop'unun kontrat fiyatına çevrilmiş hali")
+        if kp > 0 and mult > 0 and ks > 0 and abs(kp - ks) > 0:
+            risk_pc = abs(kp - ks) * mult
+            n_risk = v_eq * v_risk / 100 / risk_pc
+            n_lev = v_eq * v_max_lev / (kp * mult)
+            n_mar = (v_eq * v_max_margin / 100 / marg) if marg > 0 else float("inf")
+            n = int(max(0, min(n_risk, n_lev, n_mar)))
+            lim = min([("risk", n_risk), ("kaldıraç", n_lev), ("teminat", n_mar)], key=lambda t: t[1])[0]
+            nom = n * kp * mult
+            move = sg["atr%"] / 100 * kp * mult * n
+            st.success(f"**{n} kontrat {'AL (LONG)' if side_long else 'SAT (SHORT)'}** · nominal {nom:,.0f} TL "
+                       f"(**{nom / v_eq:.1f}x** kaldıraç) · stop olursa ≈ {n * risk_pc:,.0f} TL "
+                       f"(%{n * risk_pc / v_eq * 100:.1f}) · {lim} sınırladı")
+            st.write(f"Günlük ortalama hareket (1 ATR) ≈ **±{move:,.0f} TL** · %5'lik hareket ≈ "
+                   f"**±{nom * 0.05:,.0f} TL** (VİOP bakiyenin %{nom * 0.05 / v_eq * 100:.0f}'i)")
+        else:
+            st.caption("Kontrat fiyatı, çarpan ve stop girince kaç kontrat açacağını hesaplarım.")
+        st.caption("Kural: Trend yönü değişince (EMA10 EMA30'u keserse) pozisyonu çevir veya kapat. Stop'u her gün "
+                   "trend yönünde güncelle, asla geri çekme. VİOP'ta akşam seansı ve hafta sonu boşluk riski var.")
 
 
 # ================= 5) RİSK =================
-with tabs[4]:
+with T_RISK:
     st.markdown("#### Hisse pozisyon hesabı")
     c = st.columns(3)
     e = c[0].number_input("Giriş", value=0.0, step=0.01, key="re")
@@ -410,7 +551,7 @@ with tabs[4]:
 
 
 # ================= 6) GÜNLÜK =================
-with tabs[5]:
+with T_JOURNAL:
     st.caption("Her işlemi buraya yaz. ⚠️ Bulut sürümünde dosya kalıcı değildir: her gün sonunda **CSV indir**, "
                "gerekirse geri yükle.")
     up_f = st.file_uploader("CSV yükle", type="csv", label_visibility="collapsed")
@@ -452,26 +593,39 @@ with tabs[5]:
 
 
 # ================= 7) PLAN =================
-with tabs[6]:
+with T_PLAN:
     st.markdown("""
-#### Günlük rutin (TR saati)
+#### Testlerden çıkan dersler
+| Ne denendi | Sonuç | Karar |
+|---|---|---|
+| Gün içi açılış kırılımı (AL sinyali), 60 gün | İşlem başı −0,05R, %39 kazanma | ❌ Tek başına kullanma |
+| Hisse: 20G zirve + hacim kırılımı, 3 yıl | İşlem başı ort. +%1,6 (son 1,5 yıl +%2,5), ~19 gün tutma | ✅ **Ana hisse stratejisi** |
+| Hisse: haftalık momentum ilk 5 | Son 1,5 yıl haftalık +%1,9 (endeks ~+%0,3) | ✅ Piyasa trendi yukarıyken |
+| VİOP BIST30 / USD-TRY long | Taşıma maliyeti yüzünden zarar | ❌ Long açma |
+| VİOP ons altın / gümüş trend takibi | Son 1,5 yıl yıllık +%25 / +%44 (gümüş çok oynak) | ✅ **Ana VİOP stratejisi** |
+
+#### Bakiye planı (275.000 TL, 5 hafta)
+- **Hisse 200.000 TL:** Aynı anda **4-5 momentum pozisyonu**, her biri bakiyenin %20-35'i. İşlem başı risk %1,5-2
+  (stop = 10 günlük dip). Piyasa trendi AŞAĞI iken 2-3 pozisyona in, kalan nakitte beklesin.
+- **VİOP 75.000 TL:** **Altın (ons) ana pozisyon**, trend yönünde. İsteğe bağlı küçük gümüş. Kaldıraç 2-4x,
+  işlem başı risk VİOP bakiyesinin %5'i. BIST30 vadeliyi yalnız piyasa trendi AŞAĞI iken **short ile korunma** için kullan.
+
+#### Günlük rutin
 | Saat | Ne yap |
 |---|---|
-| **09:00-09:40** | **Haberler** sekmesi: TCMB, enflasyon, politika, KAP. Gece ABD ve Asya nasıl kapandı? Önemli olumsuz haber varsa bugün küçük oyna. |
-| **10:00-10:30** | **İşlem yapma**, açılış aralığının oluşmasını bekle. VİOP yönüne bak. |
-| **10:30-12:30** | **Tarayıcı**: `AL` sinyalleri. Geçmiş ort R > 0 ve hacim > 1,5x olanları seç. **Hisse** sekmesinde grafiğe bak, Matriks'te fiyatı teyit et, **Risk** sekmesindeki lot ile emir gir ve **stop emrini hemen koy**. |
-| **12:30-16:00** | Yeni giriş az. Hedefe gelenleri sat, kârdaki pozisyonda stop'u girişe çek (başa baş). |
-| **16:00-17:50** | ABD açılışı (16:30) oynaklık getirir. Günlük işlemleri kapatmayı düşün. |
-| **18:00 sonrası** | **Günlük** sekmesine işlemleri yaz, CSV indir. Ne işe yaradı, ne yaramadı? |
+| **09:30** | Ayarlar: bakiyeleri güncelle. **Haberler** → 🔥 Önemli. |
+| **10:00-10:30** | İşlem yok. Açılış oynaklığı geçsin. |
+| **10:30-11:30** | **📊 VİOP**: trend yönü değişti mi? Stop'u güncelle. **🚀 Momentum**: elindeki hisselerden "ÇIKIŞ" listesine düşen var mı? Varsa sat. |
+| **17:00-17:50** | **🚀 Momentum → Bugün kırılım yapanlar**. Kapanışa yakın kırılımı teyit edilenlerden en yüksek momentumlu 1-2 tanesini al (kapanışta veya ertesi sabah). **⚡ Gün içi** sekmesi giriş zamanlaması için yardımcıdır. |
+| **18:00 sonrası** | **Günlük**'e yaz, CSV indir. |
+| **Cuma** | Momentum ilk 5 listesine bak: listeden çok düşmüş, zayıflamış pozisyonları güçlülerle değiştir. |
 
-#### Yarışma stratejisi (5 hafta, 275.000 TL)
-- **Kural 1 - büyük kayıp yok:** Tek işlemde bakiyenin %1,5-2'sinden fazla riske girme. Günde %3 kayıp = o gün biter.
-- **Kural 2 - kazananı büyüt:** Hedef stop'un en az 2 katı. %40 kazanma oranıyla bile 2R hedef kâr bırakır.
-- **Kural 3 - az ama iyi işlem:** Günde 2-4 kaliteli işlem, onlarca rastgele işlemden iyidir (komisyon da yer).
-- **Sıralamaya göre ayar:** İlk 2 hafta temkinli (%1-1,5 risk). Son hafta sıralamada gerideysen riski %2-3'e çıkar, öndeysen düşür ve koru.
-- **VİOP (75.000 TL):** Yalnız yön netken (LONG/SHORT) ve en fazla 1-2 kontratla gir. Teminatın yarısından fazlasını kullanma.
-- **Bakiye dağılımı:** %80 hisse / %20 VİOP zaten yarışmanın kuralı. Hisse tarafında aynı anda 3-4 pozisyondan fazlası takibi zorlaştırır.
-- **Haber günleri:** PPK faiz kararı, TÜFE açıklaması (ayın 3'ü, 10:00) ve büyük politik olay günlerinde pozisyonu küçült.
+#### Altın kurallar
+1. **Stop'a sadık kal, kazananı erken satma.** Stratejinin kârı az sayıdaki büyük kazançtan geliyor (%40 kazanma, büyük ortalama).
+2. **Kaybedeni büyütme, ortalama düşürme yapma.**
+3. **Sıralama taktiği:** İlk 2 hafta normal risk. Son 1-2 haftada sıralamada gerideysen hisse riskini %2,5-3'e, VİOP kaldıracını 5-6x'e çıkar;
+   öndeysen riski yarıya indir ve koru. (Kaldıraç kaybı da aynı oranda büyütür.)
+4. **Haber günleri:** PPK faiz kararı, TÜFE (ayın 3'ü 10:00), ABD Fed/enflasyon verisi (altını etkiler) öncesi pozisyonu küçült.
 
-> Bu uygulama olasılık verir, kesinlik değil. Son karar ve emir senin.
+> Geçmiş test gelecek garantisi değildir. Bu uygulama olasılık verir; son karar ve emir senin.
 """)
